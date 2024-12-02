@@ -7,6 +7,8 @@ from gtts import gTTS
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+import math
+
 
 class CircleDataset(Dataset):
     def __init__(self, img_dir, target_dir):
@@ -22,16 +24,19 @@ class CircleDataset(Dataset):
         img_path = os.path.join(self.img_dir, self.img_files[idx])
         target_path = os.path.join(self.target_dir, self.target_files[idx])
         
-        img = torch.load(img_path).float() / 255.0  # Normalize to [0, 1]
-        target = torch.load(target_path).size(0)  # Count the number of circles
+        img = torch.load(img_path).float() / 255.0
+        target = torch.load(target_path).size(0)
         
-        return img.unsqueeze(0), torch.tensor([target], dtype=torch.float32)  # Add channel dimension
+        return img.unsqueeze(0), torch.tensor([target], dtype=torch.float32)
+
+
 
 # 학습 데이터 로드
 train_dataset = CircleDataset('train/img', 'train/target')
-train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
+train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
 
 
+# basic model
 class CircleNet(nn.Module):
     def __init__(self):
         super().__init__()
@@ -41,26 +46,34 @@ class CircleNet(nn.Module):
             nn.MaxPool2d(2),
             nn.Conv2d(16, 32, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.MaxPool2d(2)
+            nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((7, 7)) 
         )
+        
         self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(32 * 104 * 104, 128),
+            nn.Linear(64 * 7 * 7, 128), 
             nn.ReLU(),
-            nn.Linear(128, 1) 
+            nn.Dropout(0.5),
+            nn.Linear(128, 1)
         )
 
     def forward(self, x):
-        return self.classifier(self.features(x))
+        x = self.features(x)
+        return self.classifier(x)
+
 
 def get_memory_usage():
     process = psutil.Process(os.getpid())
     return process.memory_info().rss / 1024 / 1024
 
-def detect_circles(frame, model):
+def detect_circles(frame, model, device):
+    # 이미지 전처리
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     img = cv2.resize(gray, (416, 416))
-    img_tensor = torch.FloatTensor(img).unsqueeze(0).unsqueeze(0) / 255.0  # 이미지 정규화 및 배치 추가
+    img_tensor = torch.FloatTensor(img).unsqueeze(0).unsqueeze(0).to(device) / 255.0
     
     # OpenCV로 원의 위치 검출
     blurred = cv2.GaussianBlur(gray, (9, 9), 2)
@@ -122,16 +135,18 @@ def detect_circles(frame, model):
     return merged_circles, len(merged_circles) 
 
 
-def measure_performance(frame, model, circles):
+def measure_performance(frame, model, device, circles=None):
     start_time = time.time()
-    circles = detect_circles(frame, model)
+    circles, num_circles = detect_circles(frame, model, device)
     inference_time = (time.time() - start_time) * 1000
 
     return {
         'inference_time_ms': inference_time,
         'memory_mb': get_memory_usage(),
-        'num_circles': circles
+        'num_circles': num_circles,
+        'circles': circles
     }
+
 
 def gstreamer_pipeline(
     sensor_id=0,
@@ -160,18 +175,24 @@ def gstreamer_pipeline(
         )
     )
 
+
+
 def main():
     # 모델 및 학습 설정
     device = torch.device("cpu") #cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
     model = CircleNet().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     criterion = nn.MSELoss().to(device)
 
     # 학습
-    for epoch in range(10):  # Adjust the number of epochs as needed
+    for epoch in range(2):
         model.train()
         running_loss = 0.0
         for imgs, targets in train_loader:
+            imgs = imgs.to(device)
+            targets = targets.to(device)
+            
             optimizer.zero_grad()
             outputs = model(imgs)
             loss = criterion(outputs, targets)
@@ -179,6 +200,9 @@ def main():
             optimizer.step()
             running_loss += loss.item()
         print(f"Epoch {epoch+1}, Loss: {running_loss / len(train_loader):.4f}")
+
+    torch.save(model.state_dict(), 'Basic_model.pth')
+    print("Trained model saved.")
 
     model.eval()
     print("Training completed. Starting camera...")
@@ -226,6 +250,8 @@ def main():
 
     cap.release()
     cv2.destroyAllWindows()
-    
+
+
 if __name__ == "__main__":
     main()
+
