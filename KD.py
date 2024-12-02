@@ -10,7 +10,6 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import math
 
-# 데이터셋 클래스는 동일하게 유지
 class CircleDataset(Dataset):
     def __init__(self, img_dir, target_dir):
         self.img_dir = img_dir
