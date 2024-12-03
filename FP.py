@@ -225,7 +225,7 @@ def main():
     train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
 
     # 초기 모델 생성
-    model = CircleNet_FP(pruning_ratio=0.25).to(device)
+    model = CircleNet_FP(pruning_ratio=0.5).to(device)
     
     # 학습 전 필터 pruning 수행
     model = model.prune_filters()
