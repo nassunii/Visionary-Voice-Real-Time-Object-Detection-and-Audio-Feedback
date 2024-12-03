@@ -6,17 +6,14 @@ import os
 from gtts import gTTS
 import torch
 import torch.nn as nn
-from torch.cuda.amp import autocast
-import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 class CircleDataset(Dataset):
-    def __init__(self, img_dir, target_dir, enable_fp16=True):
+    def __init__(self, img_dir, target_dir):
         self.img_dir = img_dir
         self.target_dir = target_dir
         self.img_files = sorted(os.listdir(img_dir))
         self.target_files = sorted(os.listdir(target_dir))
-        self.enable_fp16 = enable_fp16
 
     def __len__(self):
         return len(self.img_files)
@@ -28,112 +25,98 @@ class CircleDataset(Dataset):
         img = torch.load(img_path).float() / 255.0
         target = torch.load(target_path).size(0)
         
-        if self.enable_fp16:
-            img = img.half()
-            target = torch.tensor([target], dtype=torch.float16)
-        else:
-            target = torch.tensor([target], dtype=torch.float32)
-        
-        return img.unsqueeze(0), target
-    
-    # 학습 데이터 로드
-train_dataset = CircleDataset('train/img', 'train/target')
-train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
+        return img.unsqueeze(0), torch.tensor([target], dtype=torch.float32)
 
-class CircleNet_Q(nn.Module):
-    def __init__(self, enable_fp16=True):
+class CircleNet_FP(nn.Module):
+    def __init__(self, pruning_ratio=0.25):
         super().__init__()
-        self.enable_fp16 = enable_fp16 and torch.cuda.is_available()
+        # 초기 채널 수 정의
+        self.channels = {
+            'conv1': 16,
+            'conv2': 32,
+            'conv3': 64
+        }
+        self.pruning_ratio = pruning_ratio
         
+        # 초기 모델 구성
         self.features = nn.Sequential(
-            nn.Conv2d(1, 16, kernel_size=3, padding=1),
+            nn.Conv2d(1, self.channels['conv1'], kernel_size=3, padding=1),
             nn.ReLU(),
             nn.MaxPool2d(2),
-            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.Conv2d(self.channels['conv1'], self.channels['conv2'], kernel_size=3, padding=1),
             nn.ReLU(),
             nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.Conv2d(self.channels['conv2'], self.channels['conv3'], kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.AdaptiveAvgPool2d((7, 7)) 
+            nn.AdaptiveAvgPool2d((7, 7))
         )
-
+        
         self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(64 * 7 * 7, 128),
+            nn.Linear(self.channels['conv3'] * 7 * 7, 128),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(128, 1)
+        )
+    
+    def forward(self, x):
+        x = self.features(x)
+        return self.classifier(x)
+        
+    def get_filter_importance(self, conv_layer):
+        # L1-norm을 사용하여 각 필터의 중요도 계산
+        importance = torch.sum(torch.abs(conv_layer.weight.data), dim=(1, 2, 3))
+        return importance
+
+    def prune_filters(self):
+        new_model = CircleNet_FP(self.pruning_ratio)
+        
+        # 각 conv layer에 대해 필터 중요도 계산 및 pruning
+        conv_layers = [module for module in self.modules() if isinstance(module, nn.Conv2d)]
+        new_conv_layers = [module for module in new_model.modules() if isinstance(module, nn.Conv2d)]
+        
+        prev_remaining_filters = 1  # 입력 채널은 1
+        
+        for i, (conv, new_conv) in enumerate(zip(conv_layers, new_conv_layers)):
+            importance = self.get_filter_importance(conv)
+            num_filters = importance.size(0)
+            num_keep = int(num_filters * (1 - self.pruning_ratio))
+            
+            # 중요도가 높은 필터의 인덱스 선택
+            _, indices = torch.sort(importance, descending=True)
+            keep_indices = indices[:num_keep]
+            
+            # 선택된 필터만 새 모델로 복사
+            new_conv.weight.data = conv.weight.data[keep_indices][:, :prev_remaining_filters]
+            if conv.bias is not None:
+                new_conv.bias.data = conv.bias.data[keep_indices]
+            
+            prev_remaining_filters = num_keep
+            
+            # channels 업데이트
+            if i == 0:
+                self.channels['conv1'] = num_keep
+            elif i == 1:
+                self.channels['conv2'] = num_keep
+            else:
+                self.channels['conv3'] = num_keep
+        
+        # Classifier의 입력 차원 조정
+        in_features = self.channels['conv3'] * 7 * 7
+        new_model.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(in_features, 128),
             nn.ReLU(),
             nn.Dropout(0.5),
             nn.Linear(128, 1)
         )
         
-        self.apply(self._init_weights)
-        
-        # Convert model to FP16 if enabled
-        if self.enable_fp16:
-            self.half()
-            
-        if torch.cuda.is_available():
-            self.cuda()
-            torch.backends.cudnn.benchmark = True
-            
-    def _init_weights(self, m):
-        if isinstance(m, (nn.Conv2d, nn.Linear)):
-            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
-            if self.enable_fp16:
-                m.weight.data = m.weight.data.half()
-                if m.bias is not None:
-                    m.bias.data = m.bias.data.half()
-    
-    def forward(self, x):
-        if self.enable_fp16 and x.dtype != torch.float16:
-            x = x.half()
-        
-        with autocast(enabled=self.enable_fp16):
-            x = self.features(x)
-            x = self.classifier(x)
-        
-        return x
+        return new_model
 
-class CircleTrainer:
-    def __init__(self, model, criterion, optimizer, device, enable_fp16=True):
-        self.model = model
-        self.criterion = criterion
-        self.optimizer = optimizer
-        self.device = device
-        self.enable_fp16 = enable_fp16 and torch.cuda.is_available()  # GPU 있을 때만 FP16 사용
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.enable_fp16)
-    
-    def train_step(self, inputs, targets):
-        self.model.train()
-        self.optimizer.zero_grad()
-        
-        inputs = inputs.to(self.device)
-        targets = targets.to(self.device)
-        
-        if self.enable_fp16:
-            inputs = inputs.half()
-            targets = targets.half()
-        
-        with autocast(enabled=self.enable_fp16):
-            outputs = self.model(inputs)
-            loss = self.criterion(outputs, targets)
-        
-        if self.enable_fp16:
-            self.scaler.scale(loss).backward()
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-        else:
-            loss.backward()
-            self.optimizer.step()
-        
-        return loss.item()
-    
 def get_memory_usage():
     return psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
 
-def detect_circles(frame, model, device, enable_fp16=True):
-    enable_fp16 = enable_fp16 and torch.cuda.is_available()
+def detect_circles(frame, model, device):
     # 이미지 전처리
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     img = cv2.resize(gray, (416, 416))
@@ -150,7 +133,6 @@ def detect_circles(frame, model, device, enable_fp16=True):
     
     contours, _ = cv2.findContours(thresh, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     
-    # 원 후보 검출
     circles = []
     for contour in contours:
         area = cv2.contourArea(contour)
@@ -162,7 +144,6 @@ def detect_circles(frame, model, device, enable_fp16=True):
                 (x, y), radius = cv2.minEnclosingCircle(contour)
                 circles.append((int(x), int(y), int(radius)))
     
-    # 근접한 원들 병합
     merged_circles = []
     used = set()
     
@@ -177,9 +158,8 @@ def detect_circles(frame, model, device, enable_fp16=True):
             if j in used:
                 continue
                 
-            # 두 원의 중심점 사이 거리 계산
             distance = np.sqrt((x1-x2)**2 + (y1-y2)**2)
-            if distance < max(r1, r2):  # 원이 겹치는 경우
+            if distance < max(r1, r2):
                 current[0] += x2
                 current[1] += y2
                 current[2] += r2
@@ -192,11 +172,10 @@ def detect_circles(frame, model, device, enable_fp16=True):
         if i not in used:
             merged_circles.append(tuple(current))
     
-    # 딥러닝 모델로 검증 (필요한 경우)
     with torch.no_grad():
         pred = model(img_tensor)
     
-    return merged_circles, len(merged_circles) 
+    return merged_circles, len(merged_circles)
 
 def measure_performance(frame, model, device, circles=None):
     start_time = time.time()
@@ -238,37 +217,44 @@ def gstreamer_pipeline(
     )
 
 def main():
-    # CPU 사용 (quantization은 CPU에서만 지원)
-    enable_fp16 = False
     device = torch.device("cpu")
     print(f"Using device: {device}")
 
-    train_dataset = CircleDataset('train/img', 'train/target', enable_fp16=enable_fp16)
+    # 학습 데이터 로드
+    train_dataset = CircleDataset('train/img', 'train/target')
     train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
+
+    # 초기 모델 생성
+    model = CircleNet_FP(pruning_ratio=0.25).to(device)
     
-    model = CircleNet_Q(enable_fp16=True).to(device)
-    criterion = nn.MSELoss()
+    # 학습 전 필터 pruning 수행
+    model = model.prune_filters()
+    
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    trainer = CircleTrainer(model, criterion, optimizer, device, enable_fp16=enable_fp16)
+    criterion = nn.MSELoss().to(device)
 
     # 학습
-    num_epochs = 2
-    for epoch in range(num_epochs):
+    for epoch in range(2):
+        model.train()
         running_loss = 0.0
         for imgs, targets in train_loader:
-            loss = trainer.train_step(imgs, targets)
-            running_loss += loss
+            imgs = imgs.to(device)
+            targets = targets.to(device)
             
-        print(f"Epoch {epoch+1}/{num_epochs}, Loss: {running_loss/len(train_loader):.4f}")
+            optimizer.zero_grad()
+            outputs = model(imgs)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item()
+        print(f"Epoch {epoch+1}, Loss: {running_loss / len(train_loader):.4f}")
 
-    # 모델 저장
-    torch.save(model.state_dict(), 'Q_model.pth')
+    torch.save(model.state_dict(), 'FP_model.pth')
     print("Trained model saved.")
 
     model.eval()
     print("Training completed. Starting camera...")
     
-    # 카메라 실행
     cap = cv2.VideoCapture(gstreamer_pipeline(flip_method=0), cv2.CAP_GSTREAMER)
     
     while True:
@@ -276,14 +262,16 @@ def main():
         if not ret:
             break
         
-        metrics = measure_performance(frame, model, device)
+        metrics = measure_performance(frame, model, device, None)
         
-        # 검출된 원 표시
         for (x, y, r) in metrics['circles']:
             cv2.circle(frame, (x, y), r, (0, 255, 0), 2)
             cv2.circle(frame, (x, y), 2, (0, 0, 255), 3)
         
-        # 정보 표시
+        detected_count = len(metrics['circles'])
+        cv2.putText(frame, f"Circles: {detected_count}", (10, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        
         cv2.putText(frame, f"Circles: {metrics['num_circles']}", (10, 30), 
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
         cv2.putText(frame, f"Time: {metrics['inference_time_ms']:.1f}ms", (10, 60), 
@@ -302,7 +290,7 @@ def main():
             text = f"{metrics['num_circles']}개의 원이 있습니다."
             tts = gTTS(text=text, lang='ko')
             tts.save("circles.wav")
-            os.system("aplay circles.wav")  # Linux 명령어로 변경
+            os.system("start circles.wav")
 
     cap.release()
     cv2.destroyAllWindows()
