@@ -28,7 +28,7 @@ class CircleDataset(Dataset):
         return img.unsqueeze(0), torch.tensor([target], dtype=torch.float32)
 
 class CircleNet_FP(nn.Module):
-    def __init__(self, pruning_ratio=0.25):
+    def __init__(self, pruning_ratio=0.5):
         super().__init__()
         # 초기 채널 수 정의
         self.channels = {
