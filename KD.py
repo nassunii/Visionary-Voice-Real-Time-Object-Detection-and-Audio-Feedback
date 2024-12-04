@@ -16,6 +16,7 @@ class CircleDataset(Dataset):
         self.target_dir = target_dir
         self.img_files = sorted(os.listdir(img_dir))
         self.target_files = sorted(os.listdir(target_dir))
+        self.max_circles = 5  
 
     def __len__(self):
         return len(self.img_files)
@@ -24,16 +25,25 @@ class CircleDataset(Dataset):
         img_path = os.path.join(self.img_dir, self.img_files[idx])
         target_path = os.path.join(self.target_dir, self.target_files[idx])
         
-        img = torch.load(img_path).float() / 255.0
-        target = torch.load(target_path).size(0)
+        img = torch.load(img_path, weights_only=True).float() / 255.0
+        targets = torch.load(target_path, weights_only=True)  # [x, y, r] 정보 사용
         
-        return img.unsqueeze(0), torch.tensor([target], dtype=torch.float32)
+        # Normalize coordinates
+        targets[:, 0] = targets[:, 0] / 416  # x coordinate
+        targets[:, 1] = targets[:, 1] / 416  # y coordinate
+        targets[:, 2] = targets[:, 2] / 416  # radius
+
+        # Padding
+        padded_target = torch.zeros(self.max_circles, 3)
+        num_circles = min(targets.size(0), self.max_circles)
+        padded_target[:num_circles] = targets[:num_circles]
+        
+        return img.unsqueeze(0), padded_target
 
 
 # 학습 데이터 로드
 train_dataset = CircleDataset('train/img', 'train/target')
 train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
-
 
 class TeacherNet(nn.Module):
     def __init__(self):
@@ -47,27 +57,27 @@ class TeacherNet(nn.Module):
             nn.MaxPool2d(2),
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.AdaptiveAvgPool2d((7, 7)) 
+            nn.AdaptiveAvgPool2d((7, 7))
         )
         
-        self.classifier = nn.Sequential(
+        self.detector = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(64 * 7 * 7, 128), 
+            nn.Linear(64 * 7 * 7, 128),
             nn.ReLU(),
             nn.Dropout(0.5),
-            nn.Linear(128, 1)
+            nn.Linear(128, 5 * 3)  # 5개 원의 x, y, r
         )
 
     def forward(self, x):
         x = self.features(x)
-        return self.classifier(x)
-
+        x = self.detector(x)
+        return x.view(-1, 5, 3)
 
 class StudentNet(nn.Module):
     def __init__(self):
         super().__init__()
         self.features = nn.Sequential(
-            nn.Conv2d(1, 8, kernel_size=3, padding=1),
+            nn.Conv2d(1, 8, kernel_size=3, padding=1),  # 채널 수 감소
             nn.ReLU(),
             nn.MaxPool2d(2),
             nn.Conv2d(8, 16, kernel_size=3, padding=1),
@@ -78,21 +88,37 @@ class StudentNet(nn.Module):
             nn.AdaptiveAvgPool2d((7, 7))
         )
         
-        self.classifier = nn.Sequential(
+        self.detector = nn.Sequential(
             nn.Flatten(),
             nn.Linear(32 * 7 * 7, 64),
             nn.ReLU(),
             nn.Dropout(0.3),
-            nn.Linear(64, 1)
+            nn.Linear(64, 5 * 3)  # Teacher와 동일한 출력
         )
 
     def forward(self, x):
         x = self.features(x)
-        return self.classifier(x)
+        x = self.detector(x)
+        return x.view(-1, 5, 3)
 
-def get_memory_usage():
-    process = psutil.Process(os.getpid())
-    return process.memory_info().rss / 1024 / 1024
+class DistillationLoss(nn.Module):
+    def __init__(self, T=2.0, alpha=0.3):
+        super().__init__()
+        self.T = T
+        self.alpha = alpha
+        self.criterion = nn.MSELoss()
+
+    def forward(self, student_outputs, teacher_outputs, targets):
+        # Hard Loss - 실제 타겟과의 MSE
+        hard_loss = self.criterion(student_outputs, targets)
+        
+        # Soft Loss - 교사 모델의 출력과의 MSE
+        soft_loss = self.criterion(
+            student_outputs / self.T,
+            teacher_outputs / self.T
+        )
+        
+        return (1 - self.alpha) * hard_loss + self.alpha * soft_loss
 
 def detect_circles(frame, model, device):
     # 이미지 전처리
@@ -100,64 +126,25 @@ def detect_circles(frame, model, device):
     img = cv2.resize(gray, (416, 416))
     img_tensor = torch.FloatTensor(img).unsqueeze(0).unsqueeze(0).to(device) / 255.0
     
-    # OpenCV로 원의 위치 검출
-    blurred = cv2.GaussianBlur(gray, (9, 9), 2)
-    thresh = cv2.adaptiveThreshold(
-        blurred, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV,
-        11, 2
-    )
-    
-    contours, _ = cv2.findContours(thresh, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    
-    # 원 후보 검출
-    circles = []
-    for contour in contours:
-        area = cv2.contourArea(contour)
-        perimeter = cv2.arcLength(contour, True)
-        
-        if perimeter > 0:
-            circularity = 4 * np.pi * area / (perimeter * perimeter)
-            if circularity > 0.7 and area > 100:
-                (x, y), radius = cv2.minEnclosingCircle(contour)
-                circles.append((int(x), int(y), int(radius)))
-    
-    # 근접한 원들 병합
-    merged_circles = []
-    used = set()
-    
-    for i, (x1, y1, r1) in enumerate(circles):
-        if i in used:
-            continue
-            
-        current = [x1, y1, r1]
-        count = 1
-        
-        for j, (x2, y2, r2) in enumerate(circles[i+1:], i+1):
-            if j in used:
-                continue
-                
-            # 두 원의 중심점 사이 거리 계산
-            distance = np.sqrt((x1-x2)**2 + (y1-y2)**2)
-            if distance < max(r1, r2):  # 원이 겹치는 경우
-                current[0] += x2
-                current[1] += y2
-                current[2] += r2
-                count += 1
-                used.add(j)
-                
-        if count > 1:
-            current = [int(c/count) for c in current]
-            
-        if i not in used:
-            merged_circles.append(tuple(current))
-    
-    # 딥러닝 모델로 검증 (필요한 경우)
+    # 모델로 원 검출
     with torch.no_grad():
-        pred = model(img_tensor)
+        predictions = model(img_tensor)[0]  # [5, 3]
     
-    return merged_circles, len(merged_circles) 
+    # 원의 좌표를 원본 이미지 크기에 맞게 변환
+    h, w = frame.shape[:2]
+    circles = []
+    for x, y, r in predictions.cpu().numpy():
+        if r > 0.1:  # confidence threshold
+            x = int(x * w)
+            y = int(y * h)
+            r = int(r * min(w, h))
+            circles.append((x, y, r))
+    
+    return circles, len(circles)
+
+def get_memory_usage():
+    process = psutil.Process(os.getpid())
+    return process.memory_info().rss / 1024 / 1024
 
 
 def measure_performance(frame, model, device, circles=None):
@@ -198,25 +185,6 @@ def gstreamer_pipeline(
             display_height,
         )
     )
-
-class DistillationLoss(nn.Module):
-    def __init__(self, T=2.0, alpha=0.3):
-        super().__init__()
-        self.T = T
-        self.alpha = alpha
-        self.criterion = nn.MSELoss()
-
-    def forward(self, student_outputs, teacher_outputs, targets):
-        # Hard Loss
-        hard_loss = self.criterion(student_outputs, targets)
-        
-        # Soft Loss
-        soft_loss = nn.MSELoss()(
-            F.softmax(student_outputs / self.T, dim=1),
-            F.softmax(teacher_outputs / self.T, dim=1)
-        )
-        
-        return (1 - self.alpha) * hard_loss + self.alpha * soft_loss
     
 
 def train_with_distillation(teacher_model, student_model, train_loader, device, num_epochs=2):
@@ -224,19 +192,19 @@ def train_with_distillation(teacher_model, student_model, train_loader, device, 
     student_model.train()
     
     optimizer = torch.optim.Adam(student_model.parameters(), lr=0.001)
-    distill_loss = DistillationLoss()
+    distill_criterion = DistillationLoss()
     
     for epoch in range(num_epochs):
         running_loss = 0.0
-        for imgs, targets in train_loader:
+        for imgs, targets in train_loader:  # targets: [batch_size, 5, 3]
             imgs = imgs.to(device)
             targets = targets.to(device)
             
             with torch.no_grad():
-                teacher_outputs = teacher_model(imgs)
+                teacher_outputs = teacher_model(imgs)  # [batch_size, 5, 3]
             
-            student_outputs = student_model(imgs)
-            loss = distill_loss(student_outputs, teacher_outputs, targets)
+            student_outputs = student_model(imgs)  # [batch_size, 5, 3]
+            loss = distill_criterion(student_outputs, teacher_outputs, targets)
             
             optimizer.zero_grad()
             loss.backward()
@@ -282,10 +250,31 @@ def main():
     
     # Knowledge Distillation
     print("\nStarting Knowledge Distillation...")
-    student_model = train_with_distillation(teacher_model, student_model, train_loader, device)
+    distill_criterion = DistillationLoss()
+    student_optimizer = torch.optim.Adam(student_model.parameters(), lr=0.001)
+    
+    for epoch in range(2):
+        student_model.train()
+        running_loss = 0.0
+        for imgs, targets in train_loader:
+            imgs = imgs.to(device)
+            targets = targets.to(device)
+            
+            with torch.no_grad():
+                teacher_outputs = teacher_model(imgs)
+            
+            student_outputs = student_model(imgs)
+            loss = distill_criterion(student_outputs, teacher_outputs, targets)
+            
+            student_optimizer.zero_grad()
+            loss.backward()
+            student_optimizer.step()
+            
+            running_loss += loss.item()
+        print(f"Student Model - Epoch {epoch+1}, Loss: {running_loss/len(train_loader):.4f}")
     
     # 모델 저장
-    torch.save(student_model.state_dict(), 'KD_lightweight_model.pth')
+    torch.save(student_model.state_dict(), 'KD_model.pth')
     print("Distilled student model saved.")
     
     # 카메라 실행 및 추론

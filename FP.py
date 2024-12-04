@@ -14,6 +14,7 @@ class CircleDataset(Dataset):
         self.target_dir = target_dir
         self.img_files = sorted(os.listdir(img_dir))
         self.target_files = sorted(os.listdir(target_dir))
+        self.max_circles = 5
 
     def __len__(self):
         return len(self.img_files)
@@ -22,15 +23,25 @@ class CircleDataset(Dataset):
         img_path = os.path.join(self.img_dir, self.img_files[idx])
         target_path = os.path.join(self.target_dir, self.target_files[idx])
         
-        img = torch.load(img_path).float() / 255.0
-        target = torch.load(target_path).size(0)
+        # weights_only=True 추가
+        img = torch.load(img_path, weights_only=True).float() / 255.0
+        targets = torch.load(target_path, weights_only=True)  # [x, y, r] 정보
         
-        return img.unsqueeze(0), torch.tensor([target], dtype=torch.float32)
+        # Normalize coordinates
+        targets[:, 0] = targets[:, 0] / 416  # x coordinate
+        targets[:, 1] = targets[:, 1] / 416  # y coordinate
+        targets[:, 2] = targets[:, 2] / 416  # radius
+
+        # Padding for fixed size output
+        padded_target = torch.zeros(self.max_circles, 3)  # 5개의 원까지 가능
+        num_circles = min(targets.size(0), self.max_circles)
+        padded_target[:num_circles] = targets[:num_circles]
+        
+        return img.unsqueeze(0), padded_target
 
 class CircleNet_FP(nn.Module):
     def __init__(self, pruning_ratio=0.5):
         super().__init__()
-        # 초기 채널 수 정의
         self.channels = {
             'conv1': 16,
             'conv2': 32,
@@ -38,7 +49,6 @@ class CircleNet_FP(nn.Module):
         }
         self.pruning_ratio = pruning_ratio
         
-        # 초기 모델 구성
         self.features = nn.Sequential(
             nn.Conv2d(1, self.channels['conv1'], kernel_size=3, padding=1),
             nn.ReLU(),
@@ -51,38 +61,38 @@ class CircleNet_FP(nn.Module):
             nn.AdaptiveAvgPool2d((7, 7))
         )
         
-        self.classifier = nn.Sequential(
+        self.detector = nn.Sequential(
             nn.Flatten(),
             nn.Linear(self.channels['conv3'] * 7 * 7, 128),
             nn.ReLU(),
             nn.Dropout(0.5),
-            nn.Linear(128, 1)
+            nn.Linear(128, 5 * 3)  # 5개 원의 x, y, r
         )
     
     def forward(self, x):
         x = self.features(x)
-        return self.classifier(x)
+        x = self.detector(x)
+        return x.view(-1, 5, 3)  # [batch_size, 5, 3] 형태로 반환
         
     def get_filter_importance(self, conv_layer):
-        # L1-norm을 사용하여 각 필터의 중요도 계산
         importance = torch.sum(torch.abs(conv_layer.weight.data), dim=(1, 2, 3))
         return importance
 
     def prune_filters(self):
         new_model = CircleNet_FP(self.pruning_ratio)
         
-        # 각 conv layer에 대해 필터 중요도 계산 및 pruning
+        # 필터 중요도 계산 및 프루닝
         conv_layers = [module for module in self.modules() if isinstance(module, nn.Conv2d)]
         new_conv_layers = [module for module in new_model.modules() if isinstance(module, nn.Conv2d)]
         
         prev_remaining_filters = 1  # 입력 채널은 1
-        
         for i, (conv, new_conv) in enumerate(zip(conv_layers, new_conv_layers)):
+            # 필터 중요도 계산
             importance = self.get_filter_importance(conv)
             num_filters = importance.size(0)
             num_keep = int(num_filters * (1 - self.pruning_ratio))
             
-            # 중요도가 높은 필터의 인덱스 선택
+            # 중요도가 높은 필터 선택
             _, indices = torch.sort(importance, descending=True)
             keep_indices = indices[:num_keep]
             
@@ -95,26 +105,23 @@ class CircleNet_FP(nn.Module):
             
             # channels 업데이트
             if i == 0:
-                self.channels['conv1'] = num_keep
+                new_model.channels['conv1'] = num_keep
             elif i == 1:
-                self.channels['conv2'] = num_keep
+                new_model.channels['conv2'] = num_keep
             else:
-                self.channels['conv3'] = num_keep
+                new_model.channels['conv3'] = num_keep
         
-        # Classifier의 입력 차원 조정
-        in_features = self.channels['conv3'] * 7 * 7
-        new_model.classifier = nn.Sequential(
+        # detector 레이어 입력 크기 조정
+        in_features = new_model.channels['conv3'] * 7 * 7
+        new_model.detector = nn.Sequential(
             nn.Flatten(),
             nn.Linear(in_features, 128),
             nn.ReLU(),
             nn.Dropout(0.5),
-            nn.Linear(128, 1)
+            nn.Linear(128, 5 * 3)
         )
         
         return new_model
-
-def get_memory_usage():
-    return psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
 
 def detect_circles(frame, model, device):
     # 이미지 전처리
@@ -122,60 +129,59 @@ def detect_circles(frame, model, device):
     img = cv2.resize(gray, (416, 416))
     img_tensor = torch.FloatTensor(img).unsqueeze(0).unsqueeze(0).to(device) / 255.0
     
-    # OpenCV로 원의 위치 검출
-    blurred = cv2.GaussianBlur(gray, (9, 9), 2)
-    thresh = cv2.adaptiveThreshold(
-        blurred, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV,
-        11, 2
-    )
-    
-    contours, _ = cv2.findContours(thresh, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    
-    circles = []
-    for contour in contours:
-        area = cv2.contourArea(contour)
-        perimeter = cv2.arcLength(contour, True)
-        
-        if perimeter > 0:
-            circularity = 4 * np.pi * area / (perimeter * perimeter)
-            if circularity > 0.7 and area > 100:
-                (x, y), radius = cv2.minEnclosingCircle(contour)
-                circles.append((int(x), int(y), int(radius)))
-    
-    merged_circles = []
-    used = set()
-    
-    for i, (x1, y1, r1) in enumerate(circles):
-        if i in used:
-            continue
-            
-        current = [x1, y1, r1]
-        count = 1
-        
-        for j, (x2, y2, r2) in enumerate(circles[i+1:], i+1):
-            if j in used:
-                continue
-                
-            distance = np.sqrt((x1-x2)**2 + (y1-y2)**2)
-            if distance < max(r1, r2):
-                current[0] += x2
-                current[1] += y2
-                current[2] += r2
-                count += 1
-                used.add(j)
-                
-        if count > 1:
-            current = [int(c/count) for c in current]
-            
-        if i not in used:
-            merged_circles.append(tuple(current))
-    
+    # 모델로 원 검출
     with torch.no_grad():
-        pred = model(img_tensor)
+        predictions = model(img_tensor)[0]  # [5, 3]
     
-    return merged_circles, len(merged_circles)
+    # 원의 좌표를 원본 이미지 크기에 맞게 변환
+    h, w = frame.shape[:2]
+    circles = []
+    for x, y, r in predictions.cpu().numpy():
+        if r > 0.1:  # confidence threshold
+            x = int(x * w)
+            y = int(y * h)
+            r = int(r * min(w, h))
+            circles.append((x, y, r))
+    
+    return circles, len(circles)
+
+def main():
+    # 모델 및 학습 설정
+    device = torch.device("cpu")
+    print(f"Using device: {device}")
+
+    # 데이터셋 및 모델 초기화
+    train_dataset = CircleDataset('train/img', 'train/target')
+    train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
+    
+    model = CircleNet_FP(pruning_ratio=0.5).to(device)
+    model = model.prune_filters()
+    
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    criterion = nn.MSELoss().to(device)
+
+    # 학습
+    for epoch in range(2):
+        model.train()
+        running_loss = 0.0
+        for imgs, targets in train_loader:
+            imgs = imgs.to(device)
+            targets = targets.to(device)
+            
+            optimizer.zero_grad()
+            outputs = model(imgs)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item()
+        print(f"Epoch {epoch+1}, Loss: {running_loss / len(train_loader):.4f}")
+
+    torch.save(model.state_dict(), 'FP_model.pth')
+    print("Trained model saved.")
+
+def get_memory_usage():
+    return psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
+
 
 def measure_performance(frame, model, device, circles=None):
     start_time = time.time()

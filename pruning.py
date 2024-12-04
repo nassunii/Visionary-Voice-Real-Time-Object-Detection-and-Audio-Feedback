@@ -16,6 +16,7 @@ class CircleDataset(Dataset):
         self.target_dir = target_dir
         self.img_files = sorted(os.listdir(img_dir))
         self.target_files = sorted(os.listdir(target_dir))
+        self.max_circles = 5
 
     def __len__(self):
         return len(self.img_files)
@@ -24,11 +25,20 @@ class CircleDataset(Dataset):
         img_path = os.path.join(self.img_dir, self.img_files[idx])
         target_path = os.path.join(self.target_dir, self.target_files[idx])
         
-        img = torch.load(img_path).float() / 255.0
-        target = torch.load(target_path).size(0)
-        
-        return img.unsqueeze(0), torch.tensor([target], dtype=torch.float32)
+        img = torch.load(img_path, weights_only=True).float() / 255.0
+        targets = torch.load(target_path, weights_only=True)  # [x, y, r] 정보
 
+        # Normalize coordinates
+        targets[:, 0] = targets[:, 0] / 416  # x coordinate
+        targets[:, 1] = targets[:, 1] / 416  # y coordinate
+        targets[:, 2] = targets[:, 2] / 416  # radius
+
+        # Padding
+        padded_target = torch.zeros(self.max_circles, 3)
+        num_circles = min(targets.size(0), self.max_circles)
+        padded_target[:num_circles] = targets[:num_circles]
+        
+        return img.unsqueeze(0), padded_target
 
 
 # 학습 데이터 로드
@@ -50,40 +60,40 @@ class CircleNet_P(nn.Module):
             nn.MaxPool2d(2),
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.AdaptiveAvgPool2d((7, 7)) 
+            nn.AdaptiveAvgPool2d((7, 7))
         )
 
-        self.classifier = nn.Sequential(
+        self.detector = nn.Sequential(
             nn.Flatten(),
             nn.Linear(64 * 7 * 7, 128),
             nn.ReLU(),
             nn.Dropout(0.5),
-            nn.Linear(128, 1)
+            nn.Linear(128, 5 * 3)  # 5개 원의 x, y, r
         )
 
-        self.masks = {}
+        self.masks = {}  # 가중치 마스크 저장
         
-    def apply_pruning(self):
-        for name, module in self.named_modules():
-            if isinstance(module, (nn.Conv2d, nn.Linear)):
-                mask = torch.ones_like(module.weight.data)
-                tensor_flat = torch.abs(module.weight.data).flatten()
-                k = int(len(tensor_flat) * self.pruning_ratio)
-                
-                if k > 0:
-                    threshold = tensor_flat.kthvalue(k)[0]
-                    mask[torch.abs(module.weight.data) <= threshold] = 0
-                    
-                self.masks[name] = mask
-                module.weight.data *= mask
-                
     def forward(self, x):
         x = self.features(x)
-        return self.classifier(x)
+        x = self.detector(x)
+        return x.view(-1, 5, 3)
 
+    def apply_pruning(self):
+        # 각 레이어의 가중치에 대해 pruning 적용
+        with torch.no_grad():
+            for name, module in self.named_modules():
+                if isinstance(module, (nn.Conv2d, nn.Linear)):
+                    # 현재 가중치의 절댓값 계산
+                    weights = module.weight.data.abs()
+                    # pruning할 임계값 계산
+                    threshold = torch.quantile(weights.view(-1), self.pruning_ratio)
+                    # 마스크 생성 (임계값보다 작은 가중치는 0으로)
+                    mask = (weights > threshold).float()
+                    # 마스크 저장
+                    self.masks[name] = mask
+                    # 가중치에 마스크 적용
+                    module.weight.data *= mask
 
-def get_memory_usage():
-    return psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
 
 def detect_circles(frame, model, device):
     # 이미지 전처리
@@ -91,64 +101,21 @@ def detect_circles(frame, model, device):
     img = cv2.resize(gray, (416, 416))
     img_tensor = torch.FloatTensor(img).unsqueeze(0).unsqueeze(0).to(device) / 255.0
     
-    # OpenCV로 원의 위치 검출
-    blurred = cv2.GaussianBlur(gray, (9, 9), 2)
-    thresh = cv2.adaptiveThreshold(
-        blurred, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV,
-        11, 2
-    )
-    
-    contours, _ = cv2.findContours(thresh, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    
-    # 원 후보 검출
-    circles = []
-    for contour in contours:
-        area = cv2.contourArea(contour)
-        perimeter = cv2.arcLength(contour, True)
-        
-        if perimeter > 0:
-            circularity = 4 * np.pi * area / (perimeter * perimeter)
-            if circularity > 0.7 and area > 100:
-                (x, y), radius = cv2.minEnclosingCircle(contour)
-                circles.append((int(x), int(y), int(radius)))
-    
-    # 근접한 원들 병합
-    merged_circles = []
-    used = set()
-    
-    for i, (x1, y1, r1) in enumerate(circles):
-        if i in used:
-            continue
-            
-        current = [x1, y1, r1]
-        count = 1
-        
-        for j, (x2, y2, r2) in enumerate(circles[i+1:], i+1):
-            if j in used:
-                continue
-                
-            # 두 원의 중심점 사이 거리 계산
-            distance = np.sqrt((x1-x2)**2 + (y1-y2)**2)
-            if distance < max(r1, r2):  # 원이 겹치는 경우
-                current[0] += x2
-                current[1] += y2
-                current[2] += r2
-                count += 1
-                used.add(j)
-                
-        if count > 1:
-            current = [int(c/count) for c in current]
-            
-        if i not in used:
-            merged_circles.append(tuple(current))
-    
-    # 딥러닝 모델로 검증 (필요한 경우)
+    # 모델로 원 검출
     with torch.no_grad():
-        pred = model(img_tensor)
+        predictions = model(img_tensor)[0]  # [5, 3]
     
-    return merged_circles, len(merged_circles) 
+    # 원의 좌표를 원본 이미지 크기에 맞게 변환
+    h, w = frame.shape[:2]
+    circles = []
+    for x, y, r in predictions.cpu().numpy():
+        if r > 0.1:  # confidence threshold
+            x = int(x * w)
+            y = int(y * h)
+            r = int(r * min(w, h))
+            circles.append((x, y, r))
+    
+    return circles, len(circles)
 
 def measure_performance(frame, model, device, circles=None):
     start_time = time.time()
@@ -162,6 +129,8 @@ def measure_performance(frame, model, device, circles=None):
         'circles': circles
     }
 
+def get_memory_usage():
+    return psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
 
 
 def gstreamer_pipeline(
@@ -194,12 +163,16 @@ def gstreamer_pipeline(
 
 
 def main():
-    # 디바이스 설정
-    device = torch.device("cpu") #cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cpu")
     print(f"Using device: {device}")
 
-    # Pruned 모델 생성 및 초기화
+    # 데이터셋 및 모델 초기화
+    train_dataset = CircleDataset('train/img', 'train/target')
+    train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
+    
     model = CircleNet_P(pruning_ratio=0.5).to(device)
+    
+    # 처음 pruning 적용
     model.apply_pruning()
     
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
@@ -217,8 +190,17 @@ def main():
             outputs = model(imgs)
             loss = criterion(outputs, targets)
             loss.backward()
+            
+            # 가중치 업데이트 전에 gradient에도 마스크 적용
+            with torch.no_grad():
+                for name, module in model.named_modules():
+                    if isinstance(module, (nn.Conv2d, nn.Linear)):
+                        if name in model.masks:
+                            module.weight.grad *= model.masks[name]
+            
             optimizer.step()
             running_loss += loss.item()
+            
         print(f"Epoch {epoch+1}, Loss: {running_loss / len(train_loader):.4f}")
 
     torch.save(model.state_dict(), 'P_model.pth')

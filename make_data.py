@@ -21,7 +21,7 @@ def check_circle_overlap(new_circle, existing_circles):
     return False
 
 def generate_random_circle_image(size=416, max_attempts=100):
-    num_circles = torch.randint(1, 6, (1,)).item()  # 1~5개의 원 생성
+    num_circles = torch.randint(1, 6, (1,)).item() 
     img = torch.zeros(size, size)
     targets = []
 
@@ -69,6 +69,5 @@ if not os.path.exists('train/target'):
 # Generate training data
 for i in range(100):
     img, targets = generate_random_circle_image()
-    #visualize_image(img)  # 생성된 이미지 확인시 주석 해제
     torch.save(torch.tensor(img), f'train/img/circle_{i+1}.pt')
     torch.save(targets, f'train/target/circle_{i+1}.pt')

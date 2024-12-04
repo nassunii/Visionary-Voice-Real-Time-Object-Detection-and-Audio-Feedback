@@ -17,6 +17,7 @@ class CircleDataset(Dataset):
         self.img_files = sorted(os.listdir(img_dir))
         self.target_files = sorted(os.listdir(target_dir))
         self.enable_fp16 = enable_fp16
+        self.max_circles = 5
 
     def __len__(self):
         return len(self.img_files)
@@ -25,16 +26,24 @@ class CircleDataset(Dataset):
         img_path = os.path.join(self.img_dir, self.img_files[idx])
         target_path = os.path.join(self.target_dir, self.target_files[idx])
         
-        img = torch.load(img_path).float() / 255.0
-        target = torch.load(target_path).size(0)
+        img = torch.load(img_path, weights_only=True).float() / 255.0
+        targets = torch.load(target_path, weights_only=True)  # [x, y, r] 정보
+
+        # Normalize coordinates
+        targets[:, 0] = targets[:, 0] / 416  # x coordinate
+        targets[:, 1] = targets[:, 1] / 416  # y coordinate
+        targets[:, 2] = targets[:, 2] / 416  # radius
+
+        # Padding
+        padded_target = torch.zeros(self.max_circles, 3)
+        num_circles = min(targets.size(0), self.max_circles)
+        padded_target[:num_circles] = targets[:num_circles]
         
         if self.enable_fp16:
             img = img.half()
-            target = torch.tensor([target], dtype=torch.float16)
-        else:
-            target = torch.tensor([target], dtype=torch.float32)
+            padded_target = padded_target.half()
         
-        return img.unsqueeze(0), target
+        return img.unsqueeze(0), padded_target
     
     # 학습 데이터 로드
 train_dataset = CircleDataset('train/img', 'train/target')
@@ -54,20 +63,19 @@ class CircleNet_Q(nn.Module):
             nn.MaxPool2d(2),
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.AdaptiveAvgPool2d((7, 7)) 
+            nn.AdaptiveAvgPool2d((7, 7))
         )
 
-        self.classifier = nn.Sequential(
+        self.detector = nn.Sequential(
             nn.Flatten(),
             nn.Linear(64 * 7 * 7, 128),
             nn.ReLU(),
             nn.Dropout(0.5),
-            nn.Linear(128, 1)
+            nn.Linear(128, 5 * 3)  # 5개 원의 x, y, r
         )
         
         self.apply(self._init_weights)
         
-        # Convert model to FP16 if enabled
         if self.enable_fp16:
             self.half()
             
@@ -91,9 +99,37 @@ class CircleNet_Q(nn.Module):
         
         with autocast(enabled=self.enable_fp16):
             x = self.features(x)
-            x = self.classifier(x)
+            x = self.detector(x)
+            x = x.view(-1, 5, 3)  # reshape to [batch_size, 5, 3]
         
         return x
+
+def detect_circles(frame, model, device, enable_fp16=True):
+    enable_fp16 = enable_fp16 and torch.cuda.is_available()
+    # 이미지 전처리
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    img = cv2.resize(gray, (416, 416))
+    img_tensor = torch.FloatTensor(img).unsqueeze(0).unsqueeze(0).to(device) / 255.0
+    
+    if enable_fp16:
+        img_tensor = img_tensor.half()
+    
+    # 모델로 원 검출
+    with torch.no_grad():
+        with autocast(enabled=enable_fp16):
+            predictions = model(img_tensor)[0]  # [5, 3]
+    
+    # 원의 좌표를 원본 이미지 크기에 맞게 변환
+    h, w = frame.shape[:2]
+    circles = []
+    for x, y, r in predictions.cpu().float().numpy():
+        if r > 0.1:  # confidence threshold
+            x = int(x * w)
+            y = int(y * h)
+            r = int(r * min(w, h))
+            circles.append((x, y, r))
+    
+    return circles, len(circles)
 
 class CircleTrainer:
     def __init__(self, model, criterion, optimizer, device, enable_fp16=True):
@@ -101,10 +137,10 @@ class CircleTrainer:
         self.criterion = criterion
         self.optimizer = optimizer
         self.device = device
-        self.enable_fp16 = enable_fp16 and torch.cuda.is_available()  # GPU 있을 때만 FP16 사용
+        self.enable_fp16 = enable_fp16 and torch.cuda.is_available()
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.enable_fp16)
     
-    def train_step(self, inputs, targets):
+    def train_step(self, inputs, targets):  # targets: [batch_size, 5, 3]
         self.model.train()
         self.optimizer.zero_grad()
         
@@ -116,7 +152,7 @@ class CircleTrainer:
             targets = targets.half()
         
         with autocast(enabled=self.enable_fp16):
-            outputs = self.model(inputs)
+            outputs = self.model(inputs)  # [batch_size, 5, 3]
             loss = self.criterion(outputs, targets)
         
         if self.enable_fp16:
@@ -128,75 +164,9 @@ class CircleTrainer:
             self.optimizer.step()
         
         return loss.item()
-    
+
 def get_memory_usage():
     return psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
-
-def detect_circles(frame, model, device, enable_fp16=True):
-    enable_fp16 = enable_fp16 and torch.cuda.is_available()
-    # 이미지 전처리
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    img = cv2.resize(gray, (416, 416))
-    img_tensor = torch.FloatTensor(img).unsqueeze(0).unsqueeze(0).to(device) / 255.0
-    
-    # OpenCV로 원의 위치 검출
-    blurred = cv2.GaussianBlur(gray, (9, 9), 2)
-    thresh = cv2.adaptiveThreshold(
-        blurred, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV,
-        11, 2
-    )
-    
-    contours, _ = cv2.findContours(thresh, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    
-    # 원 후보 검출
-    circles = []
-    for contour in contours:
-        area = cv2.contourArea(contour)
-        perimeter = cv2.arcLength(contour, True)
-        
-        if perimeter > 0:
-            circularity = 4 * np.pi * area / (perimeter * perimeter)
-            if circularity > 0.7 and area > 100:
-                (x, y), radius = cv2.minEnclosingCircle(contour)
-                circles.append((int(x), int(y), int(radius)))
-    
-    # 근접한 원들 병합
-    merged_circles = []
-    used = set()
-    
-    for i, (x1, y1, r1) in enumerate(circles):
-        if i in used:
-            continue
-            
-        current = [x1, y1, r1]
-        count = 1
-        
-        for j, (x2, y2, r2) in enumerate(circles[i+1:], i+1):
-            if j in used:
-                continue
-                
-            # 두 원의 중심점 사이 거리 계산
-            distance = np.sqrt((x1-x2)**2 + (y1-y2)**2)
-            if distance < max(r1, r2):  # 원이 겹치는 경우
-                current[0] += x2
-                current[1] += y2
-                current[2] += r2
-                count += 1
-                used.add(j)
-                
-        if count > 1:
-            current = [int(c/count) for c in current]
-            
-        if i not in used:
-            merged_circles.append(tuple(current))
-    
-    # 딥러닝 모델로 검증 (필요한 경우)
-    with torch.no_grad():
-        pred = model(img_tensor)
-    
-    return merged_circles, len(merged_circles) 
 
 def measure_performance(frame, model, device, circles=None):
     start_time = time.time()
@@ -302,7 +272,7 @@ def main():
             text = f"{metrics['num_circles']}개의 원이 있습니다."
             tts = gTTS(text=text, lang='ko')
             tts.save("circles.wav")
-            os.system("aplay circles.wav")  # Linux 명령어로 변경
+            os.system("aplay circles.wav") 
 
     cap.release()
     cv2.destroyAllWindows()
