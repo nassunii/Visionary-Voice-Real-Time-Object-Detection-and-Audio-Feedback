@@ -40,11 +40,6 @@ class CircleDataset(Dataset):
         
         return img.unsqueeze(0), padded_target
 
-
-# 학습 데이터 로드
-train_dataset = CircleDataset('train/img', 'train/target')
-train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
-
 class TeacherNet(nn.Module):
     def __init__(self):
         super().__init__()
@@ -228,7 +223,6 @@ def main():
     teacher_model = TeacherNet().to(device)
     student_model = StudentNet().to(device)
     
-    # 교사 모델 학습
     print("Training teacher model...")
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(teacher_model.parameters(), lr=0.001)
@@ -277,7 +271,7 @@ def main():
     torch.save(student_model.state_dict(), 'KD_model.pth')
     print("Distilled student model saved.")
     
-    # 카메라 실행 및 추론
+    # 카메라 실행
     student_model.eval()
     print("Training completed. Starting camera...")
     
