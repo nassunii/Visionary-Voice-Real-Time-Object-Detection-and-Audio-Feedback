@@ -1,5 +1,5 @@
 # Visionary Voice: Real-Time Object Detection and Audio Feedback
-This project is an assignment for the **Embedded AI** course, designed to run a deep learning model using the Jetson Nano.
+This project is designed to run a deep learning model using the Jetson Nano.
 
 ## Overview
 
