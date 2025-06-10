@@ -4,7 +4,7 @@ This project is an assignment for the **Embedded AI** course, designed to run a 
 ## Overview
 
 The application operates as follows:
-1. **Circle Detection**: Recognizes the number of circles using the camera.
+1. **Real-Time Object Detection**: Utilizes the camera to detect and count objects (specifically circles).
 2. **Audio Feedback**: Returns the detected count of circles via audio output.
 
 ## Model Architecture
