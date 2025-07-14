@@ -13,9 +13,7 @@ def check_circle_overlap(new_circle, existing_circles):
     
     for circle in existing_circles:
         x2, y2, r2 = circle
-        # 두 원의 중심점 사이의 거리 계산
         distance = ((x1 - x2) ** 2 + (y1 - y2) ** 2) ** 0.5
-        # 두 원의 반지름 합보다 거리가 작으면 겹침
         if distance < (r1 + r2):
             return True
     return False
@@ -34,9 +32,7 @@ def generate_random_circle_image(size=416, max_attempts=100):
             
             new_circle = [x, y, r]
             
-            # 첫 번째 원이거나 기존 원들과 겹치지 않는 경우
             if not targets or not check_circle_overlap(new_circle, targets):
-                # 원 그리기
                 for i in range(size):
                     for j in range(size):
                         if (i - y) ** 2 + (j - x) ** 2 <= r ** 2:
@@ -58,7 +54,6 @@ def visualize_image(img):
     plt.axis('off')
     plt.show()
 
-# Directory setup
 if not os.path.exists('train'):
     os.makedirs('train')
 if not os.path.exists('train/img'):
@@ -66,7 +61,6 @@ if not os.path.exists('train/img'):
 if not os.path.exists('train/target'):
     os.makedirs('train/target')
 
-# Generate training data
 for i in range(100):
     img, targets = generate_random_circle_image()
     torch.save(torch.tensor(img), f'train/img/circle_{i+1}.pt')
