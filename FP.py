@@ -80,38 +80,30 @@ class CircleNet_FP(nn.Module):
 
     def prune_filters(self):
         new_model = CircleNet_FP(self.pruning_ratio)
-        
-        # 필터 중요도 계산 및 프루닝
         conv_layers = [module for module in self.modules() if isinstance(module, nn.Conv2d)]
         new_conv_layers = [module for module in new_model.modules() if isinstance(module, nn.Conv2d)]
         
-        prev_remaining_filters = 1  # 입력 채널은 1
+        prev_remaining_filters = 1  # 입력 채널 1
         for i, (conv, new_conv) in enumerate(zip(conv_layers, new_conv_layers)):
-            # 필터 중요도 계산
             importance = self.get_filter_importance(conv)
             num_filters = importance.size(0)
             num_keep = int(num_filters * (1 - self.pruning_ratio))
-            
-            # 중요도가 높은 필터 선택
+
             _, indices = torch.sort(importance, descending=True)
             keep_indices = indices[:num_keep]
-            
-            # 선택된 필터만 새 모델로 복사
             new_conv.weight.data = conv.weight.data[keep_indices][:, :prev_remaining_filters]
             if conv.bias is not None:
                 new_conv.bias.data = conv.bias.data[keep_indices]
             
             prev_remaining_filters = num_keep
             
-            # channels 업데이트
             if i == 0:
                 new_model.channels['conv1'] = num_keep
             elif i == 1:
                 new_model.channels['conv2'] = num_keep
             else:
                 new_model.channels['conv3'] = num_keep
-        
-        # detector 레이어 입력 크기 조정
+
         in_features = new_model.channels['conv3'] * 7 * 7
         new_model.detector = nn.Sequential(
             nn.Flatten(),
@@ -124,16 +116,12 @@ class CircleNet_FP(nn.Module):
         return new_model
 
 def detect_circles(frame, model, device):
-    # 이미지 전처리
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     img = cv2.resize(gray, (416, 416))
     img_tensor = torch.FloatTensor(img).unsqueeze(0).unsqueeze(0).to(device) / 255.0
-    
-    # 모델로 원 검출
     with torch.no_grad():
         predictions = model(img_tensor)[0]  # [5, 3]
     
-    # 원의 좌표를 원본 이미지 크기에 맞게 변환
     h, w = frame.shape[:2]
     circles = []
     for x, y, r in predictions.cpu().numpy():
@@ -146,11 +134,8 @@ def detect_circles(frame, model, device):
     return circles, len(circles)
 
 def main():
-    # 모델 및 학습 설정
     device = torch.device("cpu")
     print(f"Using device: {device}")
-
-    # 데이터셋 및 모델 초기화
     train_dataset = CircleDataset('train/img', 'train/target')
     train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
     
@@ -160,7 +145,6 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     criterion = nn.MSELoss().to(device)
 
-    # 학습
     for epoch in range(2):
         model.train()
         running_loss = 0.0
@@ -225,21 +209,14 @@ def gstreamer_pipeline(
 def main():
     device = torch.device("cpu")
     print(f"Using device: {device}")
-
-    # 학습 데이터 로드
     train_dataset = CircleDataset('train/img', 'train/target')
     train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
-
-    # 초기 모델 생성
     model = CircleNet_FP(pruning_ratio=0.5).to(device)
-    
-    # 학습 전 필터 pruning 수행
     model = model.prune_filters()
     
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     criterion = nn.MSELoss().to(device)
 
-    # 학습
     for epoch in range(2):
         model.train()
         running_loss = 0.0
