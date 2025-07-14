@@ -44,8 +44,7 @@ class CircleDataset(Dataset):
             padded_target = padded_target.half()
         
         return img.unsqueeze(0), padded_target
-    
-    # 학습 데이터 로드
+
 train_dataset = CircleDataset('train/img', 'train/target')
 train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
 
@@ -106,20 +105,17 @@ class CircleNet_Q(nn.Module):
 
 def detect_circles(frame, model, device, enable_fp16=True):
     enable_fp16 = enable_fp16 and torch.cuda.is_available()
-    # 이미지 전처리
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     img = cv2.resize(gray, (416, 416))
     img_tensor = torch.FloatTensor(img).unsqueeze(0).unsqueeze(0).to(device) / 255.0
     
     if enable_fp16:
         img_tensor = img_tensor.half()
-    
-    # 모델로 원 검출
+
     with torch.no_grad():
         with autocast(enabled=enable_fp16):
             predictions = model(img_tensor)[0]  # [5, 3]
-    
-    # 원의 좌표를 원본 이미지 크기에 맞게 변환
+
     h, w = frame.shape[:2]
     circles = []
     for x, y, r in predictions.cpu().float().numpy():
@@ -208,7 +204,6 @@ def gstreamer_pipeline(
     )
 
 def main():
-    # CPU 사용 (quantization은 CPU에서만 지원)
     enable_fp16 = False
     device = torch.device("cpu")
     print(f"Using device: {device}")
@@ -221,7 +216,6 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     trainer = CircleTrainer(model, criterion, optimizer, device, enable_fp16=enable_fp16)
 
-    # 학습
     num_epochs = 2
     for epoch in range(num_epochs):
         running_loss = 0.0
@@ -231,14 +225,10 @@ def main():
             
         print(f"Epoch {epoch+1}/{num_epochs}, Loss: {running_loss/len(train_loader):.4f}")
 
-    # 모델 저장
     torch.save(model.state_dict(), 'Q_model.pth')
     print("Trained model saved.")
-
     model.eval()
     print("Training completed. Starting camera...")
-    
-    # 카메라 실행
     cap = cv2.VideoCapture(gstreamer_pipeline(flip_method=0), cv2.CAP_GSTREAMER)
     
     while True:
@@ -247,13 +237,10 @@ def main():
             break
         
         metrics = measure_performance(frame, model, device)
-        
-        # 검출된 원 표시
         for (x, y, r) in metrics['circles']:
             cv2.circle(frame, (x, y), r, (0, 255, 0), 2)
             cv2.circle(frame, (x, y), 2, (0, 0, 255), 3)
-        
-        # 정보 표시
+
         cv2.putText(frame, f"Circles: {metrics['num_circles']}", (10, 30), 
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
         cv2.putText(frame, f"Time: {metrics['inference_time_ms']:.1f}ms", (10, 60), 
