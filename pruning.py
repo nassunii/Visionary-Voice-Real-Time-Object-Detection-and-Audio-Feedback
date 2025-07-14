@@ -38,9 +38,7 @@ class CircleDataset(Dataset):
         padded_target[:num_circles] = targets[:num_circles]
         
         return img.unsqueeze(0), padded_target
-
-
-# 학습 데이터 로드
+        
 train_dataset = CircleDataset('train/img', 'train/target')
 train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
 
@@ -70,7 +68,7 @@ class CircleNet_P(nn.Module):
             nn.Linear(128, 5 * 3)  # 5개 원의 x, y, r
         )
 
-        self.masks = {}  # 가중치 마스크 저장
+        self.masks = {}  
         
     def forward(self, x):
         x = self.features(x)
@@ -78,33 +76,24 @@ class CircleNet_P(nn.Module):
         return x.view(-1, 5, 3)
 
     def apply_pruning(self):
-        # 각 레이어의 가중치에 대해 pruning 적용
         with torch.no_grad():
             for name, module in self.named_modules():
                 if isinstance(module, (nn.Conv2d, nn.Linear)):
-                    # 현재 가중치의 절댓값 계산
                     weights = module.weight.data.abs()
-                    # pruning할 임계값 계산
                     threshold = torch.quantile(weights.view(-1), self.pruning_ratio)
-                    # 마스크 생성 (임계값보다 작은 가중치는 0으로)
                     mask = (weights > threshold).float()
-                    # 마스크 저장
                     self.masks[name] = mask
-                    # 가중치에 마스크 적용
                     module.weight.data *= mask
 
 
 def detect_circles(frame, model, device):
-    # 이미지 전처리
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     img = cv2.resize(gray, (416, 416))
     img_tensor = torch.FloatTensor(img).unsqueeze(0).unsqueeze(0).to(device) / 255.0
     
-    # 모델로 원 검출
     with torch.no_grad():
         predictions = model(img_tensor)[0]  # [5, 3]
     
-    # 원의 좌표를 원본 이미지 크기에 맞게 변환
     h, w = frame.shape[:2]
     circles = []
     for x, y, r in predictions.cpu().numpy():
@@ -165,19 +154,13 @@ def main():
     device = torch.device("cpu")
     print(f"Using device: {device}")
 
-    # 데이터셋 및 모델 초기화
     train_dataset = CircleDataset('train/img', 'train/target')
-    train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
-    
+    train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True
     model = CircleNet_P(pruning_ratio=0.5).to(device)
-    
-    # 처음 pruning 적용
     model.apply_pruning()
-    
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     criterion = nn.MSELoss().to(device)
 
-    # 학습
     for epoch in range(2):
         model.train()
         running_loss = 0.0
@@ -189,8 +172,7 @@ def main():
             outputs = model(imgs)
             loss = criterion(outputs, targets)
             loss.backward()
-            
-            # 가중치 업데이트 전에 gradient에도 마스크 적용
+
             with torch.no_grad():
                 for name, module in model.named_modules():
                     if isinstance(module, (nn.Conv2d, nn.Linear)):
@@ -207,8 +189,6 @@ def main():
 
     model.eval()
     print("Training completed. Starting camera...")
-    
-    # 카메라 실행
     cap = cv2.VideoCapture(gstreamer_pipeline(flip_method=0), cv2.CAP_GSTREAMER)
     
     while True:
@@ -217,18 +197,15 @@ def main():
             break
         
         metrics = measure_performance(frame, model, device, None)
-        
-        # 검출된 원 그리기 - 단일 원으로 표시
+
         for (x, y, r) in metrics['circles']:
-            cv2.circle(frame, (x, y), r, (0, 255, 0), 2)  # 원 둘레
-            cv2.circle(frame, (x, y), 2, (0, 0, 255), 3)  # 중심점
-        
-        # 실제 검출된 원의 개수 표시
+            cv2.circle(frame, (x, y), r, (0, 255, 0), 2)  
+            cv2.circle(frame, (x, y), 2, (0, 0, 255), 3)  
+
         detected_count = len(metrics['circles'])
         cv2.putText(frame, f"Circles: {detected_count}", (10, 30), 
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        
-        # 정보 표시
+
         cv2.putText(frame, f"Circles: {metrics['num_circles']}", (10, 30), 
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
         cv2.putText(frame, f"Time: {metrics['inference_time_ms']:.1f}ms", (10, 60), 
