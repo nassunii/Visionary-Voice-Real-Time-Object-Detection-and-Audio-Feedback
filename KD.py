@@ -26,7 +26,7 @@ class CircleDataset(Dataset):
         target_path = os.path.join(self.target_dir, self.target_files[idx])
         
         img = torch.load(img_path, weights_only=True).float() / 255.0
-        targets = torch.load(target_path, weights_only=True)  # [x, y, r] 정보 사용
+        targets = torch.load(target_path, weights_only=True) 
         
         # Normalize coordinates
         targets[:, 0] = targets[:, 0] / 416  # x coordinate
@@ -60,7 +60,7 @@ class TeacherNet(nn.Module):
             nn.Linear(64 * 7 * 7, 128),
             nn.ReLU(),
             nn.Dropout(0.5),
-            nn.Linear(128, 5 * 3)  # 5개 원의 x, y, r
+            nn.Linear(128, 5 * 3)
         )
 
     def forward(self, x):
@@ -72,7 +72,7 @@ class StudentNet(nn.Module):
     def __init__(self):
         super().__init__()
         self.features = nn.Sequential(
-            nn.Conv2d(1, 8, kernel_size=3, padding=1),  # 채널 수 감소
+            nn.Conv2d(1, 8, kernel_size=3, padding=1), 
             nn.ReLU(),
             nn.MaxPool2d(2),
             nn.Conv2d(8, 16, kernel_size=3, padding=1),
@@ -88,7 +88,7 @@ class StudentNet(nn.Module):
             nn.Linear(32 * 7 * 7, 64),
             nn.ReLU(),
             nn.Dropout(0.3),
-            nn.Linear(64, 5 * 3)  # Teacher와 동일한 출력
+            nn.Linear(64, 5 * 3)  
         )
 
     def forward(self, x):
@@ -104,10 +104,7 @@ class DistillationLoss(nn.Module):
         self.criterion = nn.MSELoss()
 
     def forward(self, student_outputs, teacher_outputs, targets):
-        # Hard Loss - 실제 타겟과의 MSE
         hard_loss = self.criterion(student_outputs, targets)
-        
-        # Soft Loss - 교사 모델의 출력과의 MSE
         soft_loss = self.criterion(
             student_outputs / self.T,
             teacher_outputs / self.T
@@ -116,16 +113,12 @@ class DistillationLoss(nn.Module):
         return (1 - self.alpha) * hard_loss + self.alpha * soft_loss
 
 def detect_circles(frame, model, device):
-    # 이미지 전처리
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     img = cv2.resize(gray, (416, 416))
     img_tensor = torch.FloatTensor(img).unsqueeze(0).unsqueeze(0).to(device) / 255.0
-    
-    # 모델로 원 검출
     with torch.no_grad():
         predictions = model(img_tensor)[0]  # [5, 3]
-    
-    # 원의 좌표를 원본 이미지 크기에 맞게 변환
+
     h, w = frame.shape[:2]
     circles = []
     for x, y, r in predictions.cpu().numpy():
@@ -214,16 +207,12 @@ def train_with_distillation(teacher_model, student_model, train_loader, device, 
 def main():
     device = torch.device("cpu") 
     print(f"Using device: {device}")
-    
-    # 데이터 로더
     train_dataset = CircleDataset('train/img', 'train/target')
     train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
-    
-    # 모델 초기화
     teacher_model = TeacherNet().to(device)
     student_model = StudentNet().to(device)
     
-    print("Training teacher model...")
+    print("Training teacher model")
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(teacher_model.parameters(), lr=0.001)
     
@@ -266,12 +255,10 @@ def main():
             
             running_loss += loss.item()
         print(f"Student Model - Epoch {epoch+1}, Loss: {running_loss/len(train_loader):.4f}")
-    
-    # 모델 저장
+
     torch.save(student_model.state_dict(), 'KD_model.pth')
     print("Distilled student model saved.")
-    
-    # 카메라 실행
+
     student_model.eval()
     print("Training completed. Starting camera...")
     
