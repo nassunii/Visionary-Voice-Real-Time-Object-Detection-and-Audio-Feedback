@@ -84,22 +84,17 @@ def preprocess_frame(frame):
     return resized
 
 def detect_circles(frame, model, device, conf_threshold=0.1):
-    # 이미지 전처리
     processed = preprocess_frame(frame)
     img_tensor = torch.FloatTensor(processed).unsqueeze(0).unsqueeze(0).to(device) / 255.0
-    
-    # 모델 추론
     with torch.no_grad():
         predictions = model(img_tensor)[0]  # [5, 3]
-    
-    # Convert normalized coordinates back to image coordinates
+
     circles = []
     h, w = frame.shape[:2]
     
     for x, y, r in predictions.cpu().numpy():
         # Confidence check using radius
         if r > conf_threshold:
-            # Convert normalized coordinates back to pixel coordinates
             x_pixel = int(x * w)
             y_pixel = int(y * h)
             r_pixel = int(r * min(w, h))
@@ -152,20 +147,15 @@ def gstreamer_pipeline(
     )
 
 def main():
-    # 모델 및 학습 설정
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-    
-    # 데이터 로드 및 모델 초기화
     train_dataset = CircleDataset('train/img', 'train/target')
     train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
     model = CircleNet().to(device)
-    
-    # 학습
+
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     criterion = nn.MSELoss()
-    
-    print("Starting training...")
+
     for epoch in range(2):  
         model.train()
         running_loss = 0.0
@@ -189,8 +179,7 @@ def main():
     
     model.eval()
     print("Starting camera...")
-    
-    # 카메라 설정
+
     try:
         cap = cv2.VideoCapture(gstreamer_pipeline(flip_method=0), cv2.CAP_GSTREAMER)
     except:
@@ -201,16 +190,12 @@ def main():
         ret, frame = cap.read()
         if not ret:
             break
-        
-        # 성능 측정 및 원 검출
+
         metrics = measure_performance(frame, model, device)
-        
-        # 검출된 원 그리기
         for (x, y, r) in metrics['circles']:
-            cv2.circle(frame, (x, y), r, (0, 255, 0), 2)  # 원 둘레
-            cv2.circle(frame, (x, y), 2, (0, 0, 255), 3)  # 중심점
-        
-        # 정보 표시
+            cv2.circle(frame, (x, y), r, (0, 255, 0), 2)  
+            cv2.circle(frame, (x, y), 2, (0, 0, 255), 3) 
+
         cv2.putText(frame, f"Circles: {metrics['num_circles']}", (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
         cv2.putText(frame, f"Time: {metrics['inference_time_ms']:.1f}ms", (10, 60),
